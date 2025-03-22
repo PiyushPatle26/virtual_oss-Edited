@@ -26,7 +26,6 @@
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <fftw3.h>
 #include <getopt.h>
 #include <math.h>
 #include <pthread.h>
@@ -41,6 +40,36 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
+#include <complex.h>
+#include <alloca.h>
+#include <stdio.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#define SWAP_COMPLEX(a, b) do { double complex temp = (a); (a) = (b); (b) = temp; } while(0)
+#define IS_POWER_OF_TWO(n) ((n) > 0 && ((n) & ((n) - 1)) == 0)
+#define ERROR_RETURN(msg) do { fprintf(stderr, "%s\n", msg); return; } while(0)
+#define SMALL_FFT_THRESHOLD 1024
+#define USE_THREAD_PARALLELISM_THRESHOLD 8192
+
+static void *aligned_malloc(size_t size, size_t alignment) {
+	void *ptr = NULL;
+	if (posix_memalign(&ptr, alignment, size) != 0) return NULL;
+	return ptr;
+}
+#define aligned_free(ptr) free(ptr)
+
+static double *cos_table = NULL;
+static double *sin_table = NULL;
+static int max_table_size = 0;
+static pthread_mutex_t twiddle_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int cpu_has_sse3 = 0;
+static int cpu_has_avx = 0;
+static int cpu_features_detected = 0;
+static double complex *fft_buffer = NULL;
+static int fft_buffer_size = 0;
+static pthread_mutex_t buffer_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #include "../virtual_utils.h"
 #include "../virtual_oss.h"
@@ -56,11 +85,198 @@ struct Equalizer {
 	/* (block_size * 2) elements, half-complex, freq domain */
 	double *fftw_freq;
 
-	fftw_plan forward;
-	fftw_plan inverse;
+	// fftw_plan forward;
+	// fftw_plan inverse;
 };
 
 static int be_silent = 0;
+
+static void detect_cpu_features() {
+	if (cpu_features_detected) return;
+	
+	size_t len = sizeof(int);
+	sysctlbyname("hw.instruction_sse3", &cpu_has_sse3, &len, NULL, 0);
+	sysctlbyname("hw.instruction_avx", &cpu_has_avx, &len, NULL, 0);
+	cpu_features_detected = 1;
+}
+
+static void init_twiddle_factors(int n) {
+	if (cos_table != NULL && n <= max_table_size) return;
+	
+	pthread_mutex_lock(&twiddle_mutex);
+	
+	if (cos_table != NULL && n <= max_table_size) {
+		pthread_mutex_unlock(&twiddle_mutex);
+		return;
+	}
+	
+	if (cos_table) {
+		free(cos_table);
+		free(sin_table);
+	}
+	
+	int new_size = 1;
+	while (new_size < n) new_size <<= 1;
+	
+	cos_table = (double*)aligned_malloc(new_size * sizeof(double), 64);
+	sin_table = (double*)aligned_malloc(new_size * sizeof(double), 64);
+	
+	if (!cos_table || !sin_table) {
+		fprintf(stderr, "Failed to allocate twiddle factor tables\n");
+		pthread_mutex_unlock(&twiddle_mutex);
+		exit(1);
+	}
+	
+	#pragma omp parallel for if(new_size > 1024)
+	for (int i = 0; i < new_size; i++) {
+		double angle = -2.0 * M_PI * i / new_size;
+		cos_table[i] = cos(angle);
+		sin_table[i] = sin(angle);
+	}
+	
+	max_table_size = new_size;
+	pthread_mutex_unlock(&twiddle_mutex);
+}
+
+static double complex* get_fft_buffer(int n, int use_stack) {
+	if (use_stack) return (double complex*)alloca(n * sizeof(double complex));
+	
+	pthread_mutex_lock(&buffer_mutex);
+	
+	if (fft_buffer == NULL || n > fft_buffer_size) {
+		if (fft_buffer) aligned_free(fft_buffer);
+		
+		fft_buffer = (double complex*)aligned_malloc(n * sizeof(double complex), 64);
+		if (!fft_buffer) {
+			pthread_mutex_unlock(&buffer_mutex);
+			return NULL;
+		}
+		
+		fft_buffer_size = n;
+	}
+	
+	double complex *buffer = fft_buffer;
+	pthread_mutex_unlock(&buffer_mutex);
+	
+	return buffer;
+}
+
+static void bit_reversal_permutation(double complex *X, int n) {
+	int log2n = 0;
+	int temp = n;
+	while (temp >>= 1) log2n++;
+	
+	for (int i = 1, j = 0; i < n; i++) {
+		int bit = n >> 1;
+		
+		while (j >= bit) {
+			j -= bit;
+			bit >>= 1;
+		}
+		j += bit;
+		
+		if (i < j) SWAP_COMPLEX(X[i], X[j]);
+	}
+}
+
+static void butterfly_operations(double complex *X, int n, int len, int is_inverse) {
+	int half_len = len >> 1;
+	int table_step = n / len;
+	double sign = is_inverse ? 1.0 : -1.0;
+	
+	#pragma omp parallel for if(n >= USE_THREAD_PARALLELISM_THRESHOLD)
+	for (int i = 0; i < n; i += len) {
+		for (int j = 0; j < half_len; j++) {
+			int idx = j * table_step;
+			double wr = cos_table[idx];
+			double wi = sign * sin_table[idx];
+			
+			int pos1 = i + j;
+			int pos2 = pos1 + half_len;
+			
+			double complex u = X[pos1];
+			double complex v = X[pos2] * (wr + I * wi);
+			
+			X[pos1] = u + v;
+			X[pos2] = u - v;
+		}
+	}
+}
+
+static void custom_fft_core(double *data, double *result, int n, int is_inverse) {
+	if (!IS_POWER_OF_TWO(n)) ERROR_RETURN("FFT length must be a power of two");
+	
+	init_twiddle_factors(n);
+	if (!cpu_features_detected) detect_cpu_features();
+	
+	int use_stack = (n <= SMALL_FFT_THRESHOLD);
+	double complex *X = get_fft_buffer(n, use_stack);
+	if (!X) ERROR_RETURN("Failed to get FFT buffer");
+	
+	if (!is_inverse) {
+		for (int i = 0; i < n; i++) X[i] = data[i];
+	} else {
+		X[0] = data[0];
+		X[n/2] = data[n/2];
+		
+		for (int i = 1; i < n/2; i++) {
+			X[i] = data[i] + I * data[n-i];
+			X[n-i] = data[i] - I * data[n-i];
+		}
+	}
+	
+	bit_reversal_permutation(X, n);
+	
+	for (int len = 2; len <= n; len <<= 1) {
+		butterfly_operations(X, n, len, is_inverse);
+	}
+	
+	if (!is_inverse) {
+		result[0] = creal(X[0]);
+		result[n/2] = creal(X[n/2]);
+		
+		for (int i = 1; i < n/2; i++) {
+			result[i] = creal(X[i]);
+			result[n-i] = cimag(X[i]);
+		}
+	} else {
+		double scale = 1.0 / n;
+		
+		for (int i = 0; i < n; i++) {
+			result[i] = creal(X[i]) * scale;
+		}
+	}
+}
+
+static void custom_fft_r2hc(double *data, double *result, int n) {
+	custom_fft_core(data, result, n, 0);
+}
+
+static void custom_ifft_hc2r(double *data, double *result, int n) {
+	custom_fft_core(data, result, n, 1);
+}
+
+static void cleanup_fft(void) {
+	pthread_mutex_lock(&twiddle_mutex);
+	if (cos_table) {
+		aligned_free(cos_table);
+		cos_table = NULL;
+	}
+	if (sin_table) {
+		aligned_free(sin_table);
+		sin_table = NULL;
+	}
+	max_table_size = 0;
+	pthread_mutex_unlock(&twiddle_mutex);
+	
+	pthread_mutex_lock(&buffer_mutex);
+	if (fft_buffer) {
+		aligned_free(fft_buffer);
+		fft_buffer = NULL;
+	}
+	fft_buffer_size = 0;
+	pthread_mutex_unlock(&buffer_mutex);
+}
 
 static void
 message(const char *fmt,...)
@@ -153,10 +369,11 @@ equalizer_init(struct Equalizer *e, int rate, int block_size)
 	e->fftw_time = (double *)malloc(buffer_size);
 	e->fftw_freq = (double *)malloc(buffer_size);
 
-	e->forward = fftw_plan_r2r_1d(block_size, e->fftw_time, e->fftw_freq,
-	    FFTW_R2HC, FFTW_MEASURE);
-	e->inverse = fftw_plan_r2r_1d(block_size, e->fftw_freq, e->fftw_time,
-	    FFTW_HC2R, FFTW_MEASURE);
+	// e->forward = fftw_plan_r2r_1d(block_size, e->fftw_time, e->fftw_freq,
+	//     FFTW_R2HC, FFTW_MEASURE);
+	// e->inverse = fftw_plan_r2r_1d(block_size, e->fftw_freq, e->fftw_time,
+	//     FFTW_HC2R, FFTW_MEASURE);
+	// No need to create FFTW plans, as we're using our own FFT functions.
 }
 
 static int
@@ -178,7 +395,9 @@ equalizer_load(struct Equalizer *eq, const char *config)
 
 	memcpy(requested_freq, eq->fftw_freq, buffer_size);
 
-	fftw_execute(eq->inverse);
+	// fftw_execute(eq->inverse);
+	custom_ifft_hc2r(eq->fftw_freq, eq->fftw_time, eq->block_size);
+
 
 	/* Multiply by symmetric window and shift */
 	for (i = 0; i < (N / 2); ++i) {
@@ -191,7 +410,9 @@ equalizer_load(struct Equalizer *eq, const char *config)
 	}
 	eq->fftw_time[0] = 0;
 
-	fftw_execute(eq->forward);
+	// fftw_execute(eq->forward);
+	custom_fft_r2hc(eq->fftw_time, eq->fftw_freq, eq->block_size);
+
 	for (i = 0; i < N; ++i) {
 		eq->fftw_freq[i] /= (double)N;
 	}
@@ -237,8 +458,9 @@ static void
 equalizer_done(struct Equalizer *eq)
 {
 
-	fftw_destroy_plan(eq->forward);
-	fftw_destroy_plan(eq->inverse);
+	// fftw_destroy_plan(eq->forward);
+	// fftw_destroy_plan(eq->inverse);
+	// No cleanup needed for our custom FFT.
 	free(eq->fftw_time);
 	free(eq->fftw_freq);
 }
